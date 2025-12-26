@@ -1050,376 +1050,435 @@
         });
         // ============== 存储管理器（防止试用次数重置） ============== //
 
-        const StorageManager = {
-            // 使用多个存储位置
-            setTrialData: function(username, data) {
-                // 添加创建时间戳（如果是第一次创建）
-                if (!data.createdTimestamp) {
-                    data.createdTimestamp = Date.now();
-                    data.firstUse = new Date().toISOString();
-                }
-                data.lastModified = Date.now();
+        // ============== 修改后的 StorageManager（作为缓存层） ============== //
 
-                // 存储到多个位置
-                localStorage.setItem(`trial_${username}`, JSON.stringify(data));
-                sessionStorage.setItem(`trial_${username}`, JSON.stringify(data));
+const StorageManager = {
+  // 缓存用户数据
+  cacheUserData: function(username, data) {
+    const cacheKey = `user_cache_${username}`;
+    const cacheData = {
+      data: data,
+      timestamp: Date.now(),
+      expiresIn: 10 * 60 * 1000 // 10分钟过期
+    };
+    
+    try {
+      localStorage.setItem(cacheKey, JSON.stringify(cacheData));
+    } catch (e) {
+      console.warn('本地缓存失败，但可以继续使用API', e);
+    }
+  },
 
-                // 额外存储一个独立的时间戳记录
-                const timestampKey = `trial_timestamp_${username}`;
-                const timestampData = {
-                    firstCreated: data.createdTimestamp,
-                    lastModified: Date.now(),
-                    count: data.count || 0,
-                    hash: this.generateHash(username, data)
-                };
+  // 获取缓存的用户数据
+  getCachedUserData: function(username) {
+    const cacheKey = `user_cache_${username}`;
+    try {
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        const cacheData = JSON.parse(cached);
+        
+        // 检查是否过期
+        if (Date.now() - cacheData.timestamp < cacheData.expiresIn) {
+          return cacheData.data;
+        } else {
+          // 缓存过期，清理
+          localStorage.removeItem(cacheKey);
+        }
+      }
+    } catch (e) {
+      console.warn('读取缓存失败', e);
+    }
+    return null;
+  },
 
-                localStorage.setItem(timestampKey, JSON.stringify(timestampData));
+  // 缓存历史记录
+  cacheRecords: function(userId, records) {
+    const cacheKey = `records_cache_${userId}`;
+    const cacheData = {
+      records: records,
+      timestamp: Date.now(),
+      expiresIn: 5 * 60 * 1000 // 5分钟过期
+    };
+    
+    try {
+      localStorage.setItem(cacheKey, JSON.stringify(cacheData));
+    } catch (e) {
+      console.warn('记录缓存失败', e);
+    }
+  },
 
-                // 设置Cookie（过期时间30天）
-                const expirationDays = 30;
-                const date = new Date();
-                date.setTime(date.getTime() + (expirationDays * 24 * 60 * 60 * 1000));
-                const expires = "expires=" + date.toUTCString();
-                const cookieData = btoa(JSON.stringify(timestampData));
-                document.cookie = `trial_timestamp_${username}=${cookieData}; ${expires}; path=/; SameSite=Strict`;
+  // 获取缓存的记录
+  getCachedRecords: function(userId) {
+    const cacheKey = `records_cache_${userId}`;
+    try {
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        const cacheData = JSON.parse(cached);
+        
+        // 检查是否过期
+        if (Date.now() - cacheData.timestamp < cacheData.expiresIn) {
+          return cacheData.records;
+        } else {
+          localStorage.removeItem(cacheKey);
+        }
+      }
+    } catch (e) {
+      console.warn('读取记录缓存失败', e);
+    }
+    return null;
+  },
 
-                // 存储首次使用时间
-                if (!localStorage.getItem(`trial_first_${username}`)) {
-                    localStorage.setItem(`trial_first_${username}`, data.createdTimestamp.toString());
-                    document.cookie = `trial_first_${username}=${data.createdTimestamp}; ${expires}; path=/`;
-                }
-            },
-
-            getTrialData: function(username) {
-                // 先检查时间戳是否被重置
-                const timestampKey = `trial_timestamp_${username}`;
-                const timestampStr = localStorage.getItem(timestampKey);
-                const cookieTimestamp = this.getCookie(`trial_timestamp_${username}`);
-
-                let earliestTimestamp = null;
-                let maxCount = 0;
-
-                // 验证时间戳一致性
-                if (timestampStr || cookieTimestamp) {
-                    try {
-                        let localTimestamp = null;
-                        let cookieData = null;
-
-                        if (timestampStr) {
-                            localTimestamp = JSON.parse(timestampStr);
-                        }
-
-                        if (cookieTimestamp) {
-                            cookieData = JSON.parse(atob(cookieTimestamp));
-                        }
-
-                        // 找出最早的创建时间
-                        if (localTimestamp && cookieData) {
-                            earliestTimestamp = Math.min(localTimestamp.firstCreated, cookieData.firstCreated);
-                            maxCount = Math.max(localTimestamp.count || 0, cookieData.count || 0);
-
-                            // 检测时间戳异常
-                            const timeDiff = Math.abs(localTimestamp.firstCreated - cookieData.firstCreated);
-                            if (timeDiff > 24 * 60 * 60 * 1000) { // 超过1天的差异
-                                console.warn('检测到时间戳异常，用户可能试图重置数据');
-                                // 记录可疑行为
-                                this.recordSuspiciousActivity(username);
-                            }
-                        } else if (localTimestamp) {
-                            earliestTimestamp = localTimestamp.firstCreated;
-                            maxCount = localTimestamp.count || 0;
-                        } else if (cookieData) {
-                            earliestTimestamp = cookieData.firstCreated;
-                            maxCount = cookieData.count || 0;
-                        }
-                    } catch (e) {
-                        console.error('时间戳验证失败:', e);
-                    }
-                }
-
-                // 然后从多个存储位置获取数据
-                const sources = [];
-
-                // 1. 从 localStorage 获取
-                const localStorageData = localStorage.getItem(`trial_${username}`);
-                if (localStorageData) {
-                    try {
-                        const parsedData = JSON.parse(localStorageData);
-                        // 如果检测到时间戳被重置，修正数据
-                        if (earliestTimestamp && parsedData.createdTimestamp &&
-                            parsedData.createdTimestamp > earliestTimestamp + 1000) {
-                            console.warn('检测到创建时间戳被修改，正在修正');
-                            parsedData.createdTimestamp = earliestTimestamp;
-                            parsedData.count = Math.max(parsedData.count || 0, maxCount);
-                        }
-                        sources.push({
-                            source: 'localStorage',
-                            data: parsedData
-                        });
-                    } catch (e) {
-                        console.error('localStorage 数据解析失败:', e);
-                    }
-                }
-
-                // 2. 从 sessionStorage 获取
-                const sessionStorageData = sessionStorage.getItem(`trial_${username}`);
-                if (sessionStorageData) {
-                    try {
-                        const parsedData = JSON.parse(sessionStorageData);
-                        sources.push({
-                            source: 'sessionStorage',
-                            data: parsedData
-                        });
-                    } catch (e) {
-                        console.error('sessionStorage 数据解析失败:', e);
-                    }
-                }
-
-                // 3. 从 Cookie 获取
-                const cookieData = this.getCookie(`trial_${username}`);
-                if (cookieData) {
-                    try {
-                        const decodedData = atob(cookieData);
-                        const parsedData = JSON.parse(decodedData);
-                        sources.push({
-                            source: 'cookie',
-                            data: parsedData
-                        });
-                    } catch (e) {
-                        console.error('Cookie 数据解析失败:', e);
-                    }
-                }
-
-                // 选择最可信的数据源
-                if (sources.length > 0) {
-                    const priorityOrder = ['localStorage', 'sessionStorage', 'cookie'];
-
-                    for (const sourceName of priorityOrder) {
-                        const source = sources.find(s => s.source === sourceName);
-                        if (source) {
-                            // 验证数据完整性
-                            if (this.verifyDataIntegrity(username, source.data)) {
-                                // 确保使用最早的时间戳
-                                if (earliestTimestamp && source.data.createdTimestamp > earliestTimestamp) {
-                                    source.data.createdTimestamp = earliestTimestamp;
-                                }
-                                return source.data;
-                            }
-                        }
-                    }
-
-                    // 如果都没有通过验证，使用第一个源
-                    return sources[0].data;
-                }
-
-                return null;
-            },
-
-            // 生成数据哈希
-            generateHash: function(username, data) {
-                const timestamp = new Date().getTime();
-                const str = `${username}_${JSON.stringify(data)}_${timestamp}_${Math.random()}`;
-                let hash = 0;
-                for (let i = 0; i < str.length; i++) {
-                    const char = str.charCodeAt(i);
-                    hash = ((hash << 5) - hash) + char;
-                    hash = hash & hash;
-                }
-                return hash.toString(16);
-            },
-
-            // 验证数据完整性
-            verifyDataIntegrity: function(username, data) {
-                const storedHash = localStorage.getItem(`trial_hash_${username}`);
-                if (!storedHash) return true; // 如果没有存储哈希，可能是首次使用
-
-                const currentHash = this.generateHash(username, data);
-                return storedHash === currentHash;
-            },
-
-            // Cookie 操作方法
-            getCookie: function(name) {
-                const nameEQ = name + "=";
-                const ca = document.cookie.split(';');
-                for (let i = 0; i < ca.length; i++) {
-                    let c = ca[i];
-                    while (c.charAt(0) === ' ') {
-                        c = c.substring(1);
-                    }
-                    if (c.indexOf(nameEQ) === 0) {
-                        return c.substring(nameEQ.length, c.length);
-                    }
-                }
-                return null;
-            },
-
-            // 清理所有存储的方法（仅用于调试）
-            clearAllStorages: function(username) {
-                console.warn('清理所有存储，仅供调试使用');
-
-                // 清理 localStorage
-                localStorage.removeItem(`trial_${username}`);
-                localStorage.removeItem(`trial_hash_${username}`);
-                localStorage.removeItem(`trial_timestamp_${username}`);
-                localStorage.removeItem(`trial_first_${username}`);
-                localStorage.removeItem(`trial_suspicious_${username}`);
-                localStorage.removeItem(`trial_restriction_${username}`);
-
-                // 清理 sessionStorage
-                sessionStorage.removeItem(`trial_${username}`);
-
-                // 清理 cookie
-                document.cookie = `trial_${username}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;`;
-                document.cookie = `trial_timestamp_${username}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;`;
-                document.cookie = `trial_first_${username}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;`;
-                document.cookie = `trial_restriction_${username}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;`;
-            },
-
-            // 迁移旧数据到新系统
-            migrateOldData: function() {
-                // 迁移旧的 trialRecords 数据到新系统
-                const oldTrialRecords = JSON.parse(localStorage.getItem('trialRecords') || '{}');
-
-                for (const username in oldTrialRecords) {
-                    if (oldTrialRecords.hasOwnProperty(username)) {
-                        const oldCount = oldTrialRecords[username];
-
-                        // 检查是否已经有新格式的数据
-                        let trialData = this.getTrialData(username);
-
-                        // 如果没有新数据，或者旧数据更大，使用旧数据
-                        if (!trialData || trialData.count < oldCount) {
-                            const newData = {
-                                count: oldCount,
-                                createdTimestamp: Date.now(),
-                                firstUse: new Date().toISOString(),
-                                lastUpdate: new Date().toISOString(),
-                                attempts: oldCount,
-                                migratedFromOld: true
-                            };
-
-                            this.setTrialData(username, newData);
-                            console.log(`已迁移用户 ${username} 的试用数据: ${oldCount} 次`);
-                        }
-                    }
-                }
-
-                // 可选：清理旧数据
-                // localStorage.removeItem('trialRecords');
-            },
-
-            // 新增：验证试用期是否过期
-            isTrialExpired: function(username) {
-                const trialData = this.getTrialData(username);
-                if (!trialData || !trialData.createdTimestamp) {
-                    return false; // 无数据，视为新用户
-                }
-
-                const TRIAL_PERIOD_DAYS = 7; // 7天试用期
-                const TRIAL_PERIOD_MS = TRIAL_PERIOD_DAYS * 24 * 60 * 60 * 1000;
-                const now = Date.now();
-                const trialAge = now - trialData.createdTimestamp;
-
-                // 如果超过试用期，返回true
-                return trialAge > TRIAL_PERIOD_MS;
-            },
-
-            // 新增：获取剩余的试用天数
-            getRemainingTrialDays: function(username) {
-                const trialData = this.getTrialData(username);
-                if (!trialData || !trialData.createdTimestamp) {
-                    return 7; // 返回完整试用期
-                }
-
-                const TRIAL_PERIOD_DAYS = 7;
-                const TRIAL_PERIOD_MS = TRIAL_PERIOD_DAYS * 24 * 60 * 60 * 1000;
-                const now = Date.now();
-                const trialAge = now - trialData.createdTimestamp;
-                const remainingMs = TRIAL_PERIOD_MS - trialAge;
-
-                if (remainingMs <= 0) return 0;
-
-                return Math.ceil(remainingMs / (24 * 60 * 60 * 1000));
-            },
-
-            // 新增：记录可疑行为
-            recordSuspiciousActivity: function(username) {
-                const activityKey = `trial_suspicious_${username}`;
-                const now = Date.now();
-                const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-
-                let activities = JSON.parse(localStorage.getItem(activityKey) || '[]');
-                activities.push({
-                    timestamp: now,
-                    type: 'timestamp_mismatch'
-                });
-
-                // 只保留最近7天的记录
-                activities = activities.filter(activity => now - activity.timestamp < 7 * ONE_DAY_MS);
-
-                localStorage.setItem(activityKey, JSON.stringify(activities));
-
-                // 如果24小时内超过2次可疑活动，进行限制
-                const recentActivities = activities.filter(activity => now - activity.timestamp < ONE_DAY_MS);
-                if (recentActivities.length > 2) {
-                    console.warn(`用户 ${username} 被检测到多次可疑活动，应用限制`);
-                    this.applyRestrictions(username);
-                }
-            },
-
-            // 新增：应用使用限制
-            applyRestrictions: function(username) {
-                const restrictionKey = `trial_restriction_${username}`;
-                const restriction = {
-                    restrictedUntil: Date.now() + (48 * 60 * 60 * 1000), // 限制48小时
-                    reason: '多次数据异常',
-                    appliedAt: Date.now()
-                };
-
-                localStorage.setItem(restrictionKey, JSON.stringify(restriction));
-
-                // 设置Cookie限制
-                const date = new Date();
-                date.setTime(date.getTime() + (48 * 60 * 60 * 1000));
-                const expires = "expires=" + date.toUTCString();
-                document.cookie = `${restrictionKey}=${btoa(JSON.stringify(restriction))}; ${expires}; path=/`;
-
-                return restriction;
-            },
-
-            // 新增：检查是否被限制
-            isRestricted: function(username) {
-                const restrictionKey = `trial_restriction_${username}`;
-                const restrictionStr = localStorage.getItem(restrictionKey);
-
-                if (restrictionStr) {
-                    try {
-                        const restriction = JSON.parse(restrictionStr);
-                        if (Date.now() < restriction.restrictedUntil) {
-                            const hoursLeft = Math.ceil((restriction.restrictedUntil - Date.now()) / (60 * 60 *
-                                1000));
-                            console.warn(`用户 ${username} 被限制使用，剩余 ${hoursLeft} 小时`);
-                            return {
-                                restricted: true,
-                                reason: restriction.reason,
-                                hoursLeft: hoursLeft
-                            };
-                        } else {
-                            // 限制已过期，清理
-                            localStorage.removeItem(restrictionKey);
-                            document.cookie = `${restrictionKey}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;`;
-                        }
-                    } catch (e) {
-                        console.error('解析限制数据失败:', e);
-                    }
-                }
-
-                return {
-                    restricted: false
-                };
+  // 清除用户缓存
+  clearUserCache: function(username) {
+    const keys = [
+      `user_cache_${username}`,
+      `records_cache_*`,
+      `trial_${username}`,
+      `trial_timestamp_${username}`
+    ];
+    
+    keys.forEach(key => {
+      try {
+        if (key.includes('*')) {
+          // 清理所有相关缓存
+          const allKeys = Object.keys(localStorage);
+          allKeys.forEach(k => {
+            if (k.startsWith(key.replace('*', ''))) {
+              localStorage.removeItem(k);
             }
-        };
+          });
+        } else {
+          localStorage.removeItem(key);
+        }
+      } catch (e) {
+        console.warn('清理缓存失败:', e);
+      }
+    });
+  },
 
+  // 迁移旧数据到新系统
+  migrateOldDataToBackend: async function() {
+    console.log('开始迁移旧数据到后端...');
+    
+    const token = localStorage.getItem('authToken');
+    if (!token) {
+      console.log('未登录，跳过数据迁移');
+      return;
+    }
+
+    try {
+      // 1. 迁移历史记录
+      const oldHistory = JSON.parse(localStorage.getItem('football-handicap-history') || '[]');
+      if (oldHistory.length > 0) {
+        console.log(`发现 ${oldHistory.length} 条旧记录，开始迁移...`);
+        
+        // 获取当前用户ID
+        const currentUser = JSON.parse(localStorage.getItem('currentUser') || '{}');
+        
+        for (const record of oldHistory) {
+          // 只迁移当前用户的记录
+          if (record.userId === currentUser.id || 
+              (record.userId === 'guest' && !currentUser.id)) {
+            
+            try {
+              const response = await fetch('/api/records', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${token}`
+                },
+                body: JSON.stringify({
+                  handicapType: record.handicapType,
+                  matchName: record.matchName || '迁移的记录',
+                  initialHandicap: parseFloat(record.initialHandicap),
+                  currentHandicap: parseFloat(record.currentHandicap),
+                  initialWater: parseFloat(record.initialWater),
+                  currentWater: parseFloat(record.currentWater),
+                  historicalRecord: record.historicalRecord,
+                  recommendation: record.recommendation,
+                  actualResult: record.actualResult || ''
+                })
+              });
+              
+              const data = await response.json();
+              if (data.success) {
+                console.log(`已迁移记录: ${record.matchName}`);
+              }
+            } catch (e) {
+              console.warn('迁移记录失败:', e);
+            }
+          }
+        }
+        
+        // 迁移完成后，可以清理旧数据（可选）
+        // localStorage.removeItem('football-handicap-history');
+      }
+
+      // 2. 迁移用户设置等
+      console.log('数据迁移完成');
+    } catch (error) {
+      console.error('数据迁移失败:', error);
+    }
+  },
+// 显示离线警告
+  showOfflineWarning: function() {
+    const warningElement = document.getElementById('offlineWarning');
+    if (!warningElement) {
+      // 创建离线警告
+      const warning = document.createElement('div');
+      warning.id = 'offlineWarning';
+      warning.style.cssText = `
+        background-color: #ff9800;
+        color: white;
+        padding: 10px;
+        text-align: center;
+        font-size: 14px;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 1000;
+      `;
+      warning.innerHTML = `
+        ⚠️ 当前处于离线模式，部分功能可能受限。
+        <button onclick="UserSystem.tryReconnect()" style="margin-left: 10px; background: white; color: #ff9800; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer;">
+          重试连接
+        </button>
+      `;
+      document.body.appendChild(warning);
+    }
+  },
+// 隐藏离线警告
+  hideOfflineWarning: function() {
+    const warning = document.getElementById('offlineWarning');
+    if (warning) {
+      warning.remove();
+    }
+  },
+// 尝试重新连接
+  tryReconnect: async function() {
+    const isOnline = await StorageManager.checkNetworkStatus();
+    
+    if (isOnline) {
+      this.hideOfflineWarning();
+      alert('网络已恢复！');
+      
+      // 同步离线数据
+      await StorageManager.syncOfflineData();
+      
+      // 重新加载数据
+      await this.loadRecords();
+    } else {
+      alert('仍然无法连接到网络，请检查网络连接。');
+    }
+  },
+// 缓存单条记录
+  cacheRecord: function(record) {
+    const currentUser = JSON.parse(localStorage.getItem('currentUser'));
+    if (!currentUser) return;
+    
+    // 获取现有缓存
+    let records = StorageManager.getCachedRecords(currentUser.id) || [];
+    
+    // 添加或更新记录
+    const index = records.findIndex(r => r.id === record.id);
+    if (index !== -1) {
+      records[index] = record;
+    } else {
+      records.push(record);
+    }
+    
+    // 排序
+    records.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    
+    // 更新缓存
+    StorageManager.cacheRecords(currentUser.id, records);
+  },
+ // 其他方法保持类似，但添加混合模式支持
+  updateActualResult: async function(recordId, result) {
+    const token = localStorage.getItem('authToken');
+    
+    // 检查网络状态
+    const isOnline = await StorageManager.checkNetworkStatus();
+    
+    if (!isOnline) {
+      // 保存到离线队列
+      StorageManager.saveOfflineData('update_record', {
+        recordId: recordId,
+        updates: { actualResult: result }
+      });
+      
+      // 更新本地显示
+      this.updateLocalRecord(recordId, { actualResult: result });
+      
+      return true;
+    }
+    
+    if (!token) return false;
+
+    try {
+      const response = await fetch('/api/records', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          recordId: recordId,
+          updates: { actualResult: result }
+        })
+      });
+
+      const data = await response.json();
+      
+      if (data.success) {
+        // 更新缓存
+        this.cacheRecord(data.record);
+        return true;
+      }
+      return false;
+    } catch (error) {
+      console.error('更新结果失败:', error);
+      
+      // 保存到离线队列
+      StorageManager.saveOfflineData('update_record', {
+        recordId: recordId,
+        updates: { actualResult: result }
+      });
+      
+      return true;
+    }
+  },
+    // 更新本地记录（不发送到服务器）
+  updateLocalRecord: function(recordId, updates) {
+    const currentUser = JSON.parse(localStorage.getItem('currentUser'));
+    if (!currentUser) return;
+    
+    let records = StorageManager.getCachedRecords(currentUser.id) || [];
+    const index = records.findIndex(r => r.id === recordId);
+    
+    if (index !== -1) {
+      records[index] = { ...records[index], ...updates };
+      StorageManager.cacheRecords(currentUser.id, records);
+      
+      // 更新显示
+      this.updateRecordDisplay(recordId, updates);
+    }
+  },
+// 更新记录显示
+  updateRecordDisplay: function(recordId, updates) {
+    const row = document.querySelector(`[data-id="${recordId}"]`);
+    if (!row) return;
+    
+    // 更新对应字段的显示
+    if (updates.actualResult) {
+      const select = row.querySelector('.actual-result-select');
+      if (select) select.value = updates.actualResult;
+    }
+},
+
+
+  // 保存离线数据（当网络不可用时）
+  saveOfflineData: function(operation, data) {
+    const offlineKey = `offline_queue_${Date.now()}`;
+    const offlineData = {
+      operation: operation, // 'create_record', 'update_record', 'delete_record'
+      data: data,
+      timestamp: Date.now()
+    };
+    
+    try {
+      // 保存到离线队列
+      let offlineQueue = JSON.parse(localStorage.getItem('offline_queue') || '[]');
+      offlineQueue.push(offlineData);
+      localStorage.setItem('offline_queue', JSON.stringify(offlineQueue));
+      
+      // 限制队列大小
+      if (offlineQueue.length > 50) {
+        offlineQueue = offlineQueue.slice(-50);
+        localStorage.setItem('offline_queue', JSON.stringify(offlineQueue));
+      }
+      
+      return true;
+    } catch (e) {
+      console.error('保存离线数据失败:', e);
+      return false;
+    }
+  },
+
+  // 同步离线数据到服务器
+  syncOfflineData: async function() {
+    const token = localStorage.getItem('authToken');
+    if (!token) return false;
+
+    try {
+      const offlineQueue = JSON.parse(localStorage.getItem('offline_queue') || '[]');
+      if (offlineQueue.length === 0) return true;
+
+      console.log(`有 ${offlineQueue.length} 条离线数据需要同步`);
+      
+      const failedOperations = [];
+      
+      for (const op of offlineQueue) {
+        try {
+          let url = '/api/records';
+          let method = 'POST';
+          
+          switch (op.operation) {
+            case 'create_record':
+              method = 'POST';
+              break;
+            case 'update_record':
+              method = 'PUT';
+              break;
+            case 'delete_record':
+              method = 'DELETE';
+              url = `${url}?recordId=${op.data.recordId}`;
+              break;
+          }
+          
+          const response = await fetch(url, {
+            method: method,
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`
+            },
+            body: op.operation !== 'delete_record' ? JSON.stringify(op.data) : undefined
+          });
+          
+          const result = await response.json();
+          if (!result.success) {
+            failedOperations.push(op);
+          }
+        } catch (e) {
+          failedOperations.push(op);
+          console.warn('同步离线数据失败:', e);
+        }
+      }
+      
+      // 更新离线队列
+      localStorage.setItem('offline_queue', JSON.stringify(failedOperations));
+      
+      return failedOperations.length === 0;
+    } catch (e) {
+      console.error('同步离线数据失败:', e);
+      return false;
+    }
+  },
+
+  // 检查网络连接状态
+  checkNetworkStatus: async function() {
+    try {
+      const response = await fetch('/api/auth?action=check', {
+        method: 'HEAD',
+        timeout: 3000
+      });
+      return response.ok;
+    } catch (e) {
+      return false;
+    }
+  }
+};
         // ============== 浏览器指纹管理器 ============== //
         const FingerprintManager = {
             // 生成快速基础指纹（立即执行）
@@ -1616,41 +1675,29 @@
         // 用户管理系统
         const UserSystem = {
             // 初始化用户数据
-            init: function() {
-                console.log('开始初始化用户系统...');
-
-                // ========== 第一步：初始化指纹系统 ========== //
-                FingerprintManager.init();
-
-                // ========== 第二步：迁移旧数据 ========== //
-                StorageManager.migrateOldData();
-
-                // ========== 第三步：初始化邀请码 ========== //
-                if (!localStorage.getItem('invitationCodes')) {
-                    localStorage.setItem('invitationCodes', JSON.stringify([]));
-                }
-
-                // ========== 第四步：初始化默认用户 ========== //
-                if (!localStorage.getItem('users')) {
-                    const defaultUsers = [{
-                        id: 1,
-                        username: 'admin',
-                        password: 'admin123',
-                        userType: 'admin',
-                        registrationDate: new Date().toISOString(),
-                        lastLogin: new Date().toISOString()
-                    }];
-                    localStorage.setItem('users', JSON.stringify(defaultUsers));
-                }
-
-                // ========== 第五步：检查登录状态 ========== //
-                this.checkLoginStatus();
-
-                console.log('用户系统初始化完成');
-
-                // 新增：清理所有用户的过期限制
-                this.cleanupExpiredRestrictions();
-            },
+            init: async function() {
+    console.log('开始初始化用户系统（混合模式）...');
+    
+    // 初始化指纹系统
+    FingerprintManager.init();
+    
+    // 检查网络状态
+    const isOnline = await StorageManager.checkNetworkStatus();
+    
+    if (isOnline) {
+      // 在线模式：检查登录状态并同步离线数据
+      await this.checkLoginStatus();
+      await StorageManager.syncOfflineData();
+    } else {
+      // 离线模式：尝试从缓存加载
+      await this.checkCachedLoginStatus();
+    }
+    
+    // 初始化UI
+    this.initUI();
+    
+    console.log('用户系统初始化完成');
+  },
 
             // 新增：清理过期限制
             cleanupExpiredRestrictions: function() {
@@ -1673,29 +1720,83 @@
                 });
             },
 
-            // 检查登录状态
-            // 检查登录状态
-            checkLoginStatus: function() {
-                const currentUser = JSON.parse(localStorage.getItem('currentUser') || 'null');
-                if (currentUser) {
-                    // ========== 新增：验证指纹 ========== //
-                    const fingerprintValid = FingerprintManager.verifyConsistency(currentUser.username);
-                    if (!fingerprintValid) {
-                        console.warn(`用户 ${currentUser.username} 指纹验证失败`);
-                        // 可以显示警告，但不强制退出
-                    }
-                    // 检查并清理过期的限制
-                    StorageManager.isRestricted(currentUser.username); // 这会自动清理过期的限制
-                    this.updateUI(currentUser);
-
-                    // 更新试用信息显示
-                    if (currentUser.userType === 'trial') {
-                        this.updateTrialInfo(currentUser.username);
-                    }
-                } else {
-                    this.showGuestUI();
-                }
-            },
+            
+            checkLoginStatus: async function() {
+    console.log('检查登录状态...');
+    
+    const token = localStorage.getItem('authToken');
+    
+    if (!token) {
+      // 没有token，显示游客UI
+      this.showGuestUI();
+      return;
+    }
+    
+    try {
+      // 先尝试从缓存获取
+      const cachedUser = StorageManager.getCachedUserData('current');
+      if (cachedUser) {
+        this.updateUI(cachedUser);
+        console.log('使用缓存的用户数据');
+      }
+      
+      // 同时验证token有效性
+      const response = await fetch('/api/auth?action=check', {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+      
+      const data = await response.json();
+      
+      if (data.success) {
+        // 更新缓存
+        StorageManager.cacheUserData('current', data.user);
+        localStorage.setItem('currentUser', JSON.stringify(data.user));
+        this.updateUI(data.user);
+        
+        // 加载记录
+        await this.loadRecords();
+      } else {
+        // token无效，清除本地数据
+        this.logout();
+      }
+    } catch (error) {
+      console.warn('检查登录状态失败，使用缓存数据:', error);
+      
+      // 网络错误时使用缓存数据
+      const cachedUser = StorageManager.getCachedUserData('current');
+      if (cachedUser) {
+        this.updateUI(cachedUser);
+        this.showOfflineWarning();
+      } else {
+        this.showGuestUI();
+      }
+    }
+  },
+// 检查缓存的登录状态（离线模式）
+  checkCachedLoginStatus: function() {
+    console.log('离线模式：检查缓存登录状态');
+    
+    const token = localStorage.getItem('authToken');
+    const cachedUser = StorageManager.getCachedUserData('current');
+    
+    if (token && cachedUser) {
+      this.updateUI(cachedUser);
+      this.showOfflineWarning();
+      
+      // 加载缓存的记录
+      const cachedRecords = StorageManager.getCachedRecords(cachedUser.id);
+      if (cachedRecords) {
+        this.displayRecords(cachedRecords);
+      }
+      
+      return true;
+    } else {
+      this.showGuestUI();
+      return false;
+    }
+  },
 
             // 显示游客UI
             showGuestUI: function() {
@@ -1833,70 +1934,108 @@
                 document.getElementById('loginModal').style.display = 'none';
                 document.getElementById('registerModal').style.display = 'none';
             },
+// 加载用户记录
+  loadUserRecords: async function() {
+    const token = localStorage.getItem('authToken');
+    
+    if (!token) return;
 
-            login: function() {
-                const username = document.getElementById('loginUsername').value.trim();
-                const password = document.getElementById('loginPassword').value.trim();
+    try {
+      const response = await fetch('/api/records', {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
 
-                // 验证输入
-                let isValid = true;
-                if (!username) {
-                    this.showError('loginUsernameError', '请输入用户名');
-                    isValid = false;
-                } else {
-                    this.hideError('loginUsernameError');
-                }
+      const data = await response.json();
+      
+      if (data.success) {
+        // 更新前端显示
+        this.displayRecords(data.records);
+      }
+    } catch (error) {
+      console.error('加载记录失败:', error);
+    }
+  },
+            // 修改登录方法
+  // 登录（混合模式）
+  login: async function() {
+    const username = document.getElementById('loginUsername').value.trim();
+    const password = document.getElementById('loginPassword').value.trim();
+    const fingerprint = FingerprintManager.getCurrentFingerprint();
 
-                if (!password) {
-                    this.showError('loginPasswordError', '请输入密码');
-                    isValid = false;
-                } else {
-                    this.hideError('loginPasswordError');
-                }
+    // 验证输入
+    let isValid = true;
+    if (!username) {
+      this.showError('loginUsernameError', '请输入用户名');
+      isValid = false;
+    } else {
+      this.hideError('loginUsernameError');
+    }
 
-                if (!isValid) return;
+    if (!password) {
+      this.showError('loginPasswordError', '请输入密码');
+      isValid = false;
+    } else {
+      this.hideError('loginPasswordError');
+    }
 
-                // 获取用户数据
-                const users = JSON.parse(localStorage.getItem('users') || '[]');
-                const user = users.find(u => u.username === username && u.password === password);
+    if (!isValid) return;
 
-                if (user) {
-                    // ========== 新增：验证指纹一致性 ========== //
-                    const fingerprintValid = FingerprintManager.verifyConsistency(username);
-                    if (!fingerprintValid) {
-                        alert('检测到浏览器环境异常，请勿频繁清除数据！');
-                    }
+    try {
+      const response = await fetch('/api/auth?action=login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ username, password, fingerprint })
+      });
 
-                    // ========== 新增：存储用户指纹关联 ========== //
-                    FingerprintManager.storeUserFingerprint(username);
+      const data = await response.json();
+      
+      if (data.success) {
+        // 保存token和用户信息
+        localStorage.setItem('authToken', data.token);
+        localStorage.setItem('currentUser', JSON.stringify(data.user));
+        
+        // 缓存用户数据
+        StorageManager.cacheUserData('current', data.user);
+        StorageManager.cacheUserData(data.user.username, data.user);
+        
+        // 更新UI
+        this.updateUI(data.user);
 
-                    // 更新最后登录时间
-                    user.lastLogin = new Date().toISOString();
-                    localStorage.setItem('users', JSON.stringify(users));
+        // 隐藏模态框
+        this.hideAllModals();
 
-                    // 保存当前用户
-                    localStorage.setItem('currentUser', JSON.stringify(user));
+        // 重新加载历史记录
+        await this.loadRecords();
 
-                    // 更新UI
-                    this.updateUI(user);
+        // 迁移旧数据（如果有）
+        await StorageManager.migrateOldDataToBackend();
 
-                    // 隐藏模态框
-                    this.hideAllModals();
+        // 显示成功消息
+        alert(`欢迎回来，${data.user.username}！`);
+      } else {
+        this.showError('loginPasswordError', data.error || '登录失败');
+      }
+    } catch (error) {
+      console.error('登录失败:', error);
+      
+      // 网络错误，检查是否有离线登录可能
+      const cachedUser = StorageManager.getCachedUserData(username);
+      if (cachedUser) {
+        // 使用缓存数据进行离线登录
+        localStorage.setItem('currentUser', JSON.stringify(cachedUser));
+        this.updateUI(cachedUser);
+        this.hideAllModals();
+        this.showOfflineWarning();
+      } else {
+        this.showError('loginPasswordError', '网络错误，请稍后重试');
+      }
+    }
+  },
 
-                    // 更新试用信息
-                    if (user.userType === 'trial') {
-                        this.updateTrialInfo(user.username);
-                    }
-
-                    // 重新加载历史记录
-                    loadHistory();
-
-                    // 显示成功消息
-                    alert(`欢迎回来，${user.username}！`);
-                } else {
-                    this.showError('loginPasswordError', '用户名或密码错误');
-                }
-            },
 
             // 注册
             register: function() {
@@ -2008,7 +2147,207 @@
                 loadHistory();
                 alert('已退出登录');
             },
+// 保存记录到后端
+   // 保存记录（混合模式）
+  saveRecord: async function(recordData) {
+    const token = localStorage.getItem('authToken');
+    const currentUser = JSON.parse(localStorage.getItem('currentUser'));
+    
+    // 检查网络状态
+    const isOnline = await StorageManager.checkNetworkStatus();
+    
+    if (!isOnline) {
+      // 离线模式：保存到本地并添加到同步队列
+      const success = StorageManager.saveOfflineData('create_record', recordData);
+      
+      if (success) {
+        // 创建临时记录显示
+        const tempRecord = {
+          id: 'temp_' + Date.now(),
+          ...recordData,
+          createdAt: new Date().toISOString(),
+          isOffline: true
+        };
+        
+        // 添加到本地缓存显示
+        this.addRecordToDisplay(tempRecord);
+        
+        alert('记录已保存到本地（离线模式），将在网络恢复后自动同步');
+        return true;
+      }
+      return false;
+    }
+    
+    if (!token || !currentUser) {
+      alert('请先登录！');
+      this.showLoginModal();
+      return false;
+    }
 
+    try {
+      const response = await fetch('/api/records', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify(recordData)
+      });
+
+      const data = await response.json();
+      
+      if (data.success) {
+        // 缓存记录
+        this.cacheRecord(data.record);
+        
+        // 更新试用信息显示
+        if (currentUser.userType === 'trial' && data.trialInfo) {
+          this.updateTrialInfo(data.trialInfo);
+        }
+        
+        return true;
+      } else {
+        alert(data.error || '保存失败');
+        return false;
+      }
+    } catch (error) {
+      console.error('保存记录失败:', error);
+      
+      // 保存到离线队列
+      const success = StorageManager.saveOfflineData('create_record', recordData);
+      
+      if (success) {
+        alert('网络错误，记录已保存到本地，将在网络恢复后自动同步');
+        return true;
+      }
+      
+      alert('网络错误，保存失败');
+      return false;
+    }
+  },
+// 保存记录（混合模式）
+  saveRecord: async function(recordData) {
+    const token = localStorage.getItem('authToken');
+    const currentUser = JSON.parse(localStorage.getItem('currentUser'));
+    
+    // 检查网络状态
+    const isOnline = await StorageManager.checkNetworkStatus();
+    
+    if (!isOnline) {
+      // 离线模式：保存到本地并添加到同步队列
+      const success = StorageManager.saveOfflineData('create_record', recordData);
+      
+      if (success) {
+        // 创建临时记录显示
+        const tempRecord = {
+          id: 'temp_' + Date.now(),
+          ...recordData,
+          createdAt: new Date().toISOString(),
+          isOffline: true
+        };
+        
+        // 添加到本地缓存显示
+        this.addRecordToDisplay(tempRecord);
+        
+        alert('记录已保存到本地（离线模式），将在网络恢复后自动同步');
+        return true;
+      }
+      return false;
+    }
+    
+    if (!token || !currentUser) {
+      alert('请先登录！');
+      this.showLoginModal();
+      return false;
+    }
+
+    try {
+      const response = await fetch('/api/records', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify(recordData)
+      });
+
+      const data = await response.json();
+      
+      if (data.success) {
+        // 缓存记录
+        this.cacheRecord(data.record);
+        
+        // 更新试用信息显示
+        if (currentUser.userType === 'trial' && data.trialInfo) {
+          this.updateTrialInfo(data.trialInfo);
+        }
+        
+        return true;
+      } else {
+        alert(data.error || '保存失败');
+        return false;
+      }
+    } catch (error) {
+      console.error('保存记录失败:', error);
+      
+      // 保存到离线队列
+      const success = StorageManager.saveOfflineData('create_record', recordData);
+      
+      if (success) {
+        alert('网络错误，记录已保存到本地，将在网络恢复后自动同步');
+        return true;
+      }
+      
+      alert('网络错误，保存失败');
+      return false;
+    }
+  },
+  // 加载记录（混合模式）
+  loadRecords: async function() {
+    const token = localStorage.getItem('authToken');
+    const currentUser = JSON.parse(localStorage.getItem('currentUser'));
+    
+    if (!token || !currentUser) {
+      // 显示游客UI
+      this.showGuestUI();
+      return [];
+    }
+    
+    // 先尝试从缓存加载
+    let records = StorageManager.getCachedRecords(currentUser.id);
+    
+    // 检查网络状态
+    const isOnline = await StorageManager.checkNetworkStatus();
+    
+    if (isOnline) {
+      try {
+        // 从服务器加载最新数据
+        const response = await fetch('/api/records', {
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        });
+
+        const data = await response.json();
+        
+        if (data.success) {
+          records = data.records;
+          
+          // 更新缓存
+          StorageManager.cacheRecords(currentUser.id, records);
+        }
+      } catch (error) {
+        console.warn('加载记录失败，使用缓存数据:', error);
+      }
+    } else {
+      this.showOfflineWarning();
+    }
+    
+    // 显示记录
+    this.displayRecords(records || []);
+    
+    return records || [];
+  },
             // 检查试用用户是否可以保存记录
             canSaveRecord: function(username) {
                 // ========== 新增：检查指纹异常 ========== //
@@ -3083,8 +3422,8 @@
         }
 
         // ============== 保存记录功能 ============== //
-        // 保存让球盘记录
-        function saveAsianRecord() {
+        // 修改原来的保存函数
+async function saveAsianRecord() {
             // 检查用户登录状态
             const currentUser = JSON.parse(localStorage.getItem('currentUser'));
             let username = 'guest';
@@ -3150,24 +3489,16 @@
             }
 
             // 创建记录对象
-            const record = {
-                id: Date.now(), // 使用时间戳作为ID
-                handicapType: 'asian', // 盘口类型：asian=让球盘
-                userId: userId,
-                username: username,
-                matchName: matchName, // 新增赛事名称
-                initialHandicap: initialHandicap,
-                currentHandicap: currentHandicap,
-                initialWater: initialWater,
-                currentWater: currentWater,
-                handicapChange: (parseFloat(currentHandicap) - parseFloat(initialHandicap)).toFixed(2),
-                waterChange: (parseFloat(currentWater) - parseFloat(initialWater)).toFixed(2),
-                historicalRecord: historicalRecord,
-                recommendation: recommendationResult,
-                actualResult: "", // 实际结果为空，用户可以后续编辑
-                timestamp: new Date().toLocaleString()
-            };
-
+             const recordData = {
+    handicapType: 'asian',
+    matchName: document.getElementById('asian-match-name').value,
+    initialHandicap: document.getElementById('asian-initial-handicap').value,
+    currentHandicap: document.getElementById('asian-current-handicap').value,
+    initialWater: document.getElementById('asian-initial-water').value,
+    currentWater: document.getElementById('asian-current-water').value,
+    historicalRecord: document.getElementById('asian-historical-record').value,
+    recommendation: document.getElementById('asian-recommendation-result').textContent
+  };
             // 从localStorage获取现有记录
             let history = JSON.parse(localStorage.getItem('football-handicap-history') || '[]');
 
@@ -3179,9 +3510,11 @@
 
             // 如果是试用用户，增加记录次数
             if (!currentUser || userType === 'trial') {
-                const success = UserSystem.incrementTrialRecord(username);
-                if (!success) {
-                    alert('保存失败：试用次数已达上限或试用期已过期！');
+                 const success = await UserSystem.saveRecord(recordData);
+  if (success) {
+    alert('记录已保存！');
+    await UserSystem.loadUserRecords();
+  }
 
                     // 如果保存失败，移除刚添加的记录
                     history = history.filter(r => r.id !== record.id);
@@ -3211,7 +3544,7 @@
             }
 
             alert(successMsg);
-        }
+        
 
         // 保存大小盘记录
         function saveSizeRecord() {

@@ -1,0 +1,21 @@
+football-handicap/
+├── index.html              # 主页面（已存在）
+├── package.json            # Node.js 依赖
+├── vercel.json            # Vercel 配置
+├── .env.local            # 本地环境变量
+├── /api/                 # API 路由
+│   ├── auth/
+│   │   ├── login.js
+│   │   ├── register.js
+│   │   ├── check.js
+│   │   └── logout.js
+│   ├── records/
+│   │   ├── index.js
+│   │   └── [id].js
+│   ├── users/
+│   │   └── trial.js
+│   └── invitation-codes/
+│       └── index.js
+└── /lib/
+    ├── db.js             # 数据库连接
+    └── auth.js           # 认证工具
