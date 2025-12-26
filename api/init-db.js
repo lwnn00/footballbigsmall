@@ -1,4 +1,4 @@
-import { db } from '@vercel/postgres';
+import { db } from '@vercel/postgres://bc3e503e72741197a4cd4474d3bb362dd0c11096c4f797d32fe693eb4e5f73fe:sk__WkPDn34hIqBR0s7KCpNJ@db.prisma.io:5432/postgres?sslmode=require';
 
 export default async function handler(req, res) {
   // 添加安全验证（可选）
